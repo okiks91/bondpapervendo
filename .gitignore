@@ -1,0 +1,20 @@
+# Arduino / ESP32 build artifacts
+build/
+*.bin
+*.elf
+*.map
+*.hex
+*.partitions.bin
+*.bootloader.bin
+*.merged.bin
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS generated
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+*.bin
