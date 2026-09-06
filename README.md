@@ -100,8 +100,8 @@ Open `http://<ESP32_IP>/` in any browser on the same network:
 
 ```
 .
-├── coin_selector_test/          # Main Vendo Firmware
-│   └── coin_selector_test.ino   # Complete integrated firmware with Web Server & LCD
+├── bond_paper_vendo/            # Main Vendo Firmware
+│   └── bond_paper_vendo.ino     # Complete integrated firmware with Web Server & LCD
 ├── button_test/                 # Standalone Active-HIGH Button Web Tester
 │   └── button_test.ino
 ├── i2c_lcd_test/                # Standalone 1602 I2C Scanner & LCD Web Tester
@@ -119,8 +119,8 @@ Open `http://<ESP32_IP>/` in any browser on the same network:
 Using **Arduino CLI**:
 ```bash
 # Compile
-arduino-cli compile --fqbn esp32:esp32:esp32 coin_selector_test
+arduino-cli compile --fqbn esp32:esp32:esp32 bond_paper_vendo
 
 # Upload
-arduino-cli upload -p COM10 --fqbn esp32:esp32:esp32 coin_selector_test
+arduino-cli upload -p COM10 --fqbn esp32:esp32:esp32 bond_paper_vendo
 ```
