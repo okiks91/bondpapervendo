@@ -41,7 +41,7 @@ String currentL2 = "";
 // Motor Speed Settings
 // =======================================================
 const int FORWARD_SPEED = 255; // 100% max speed (Full 24V)
-const int REVERSE_SPEED = 255; // 100% max speed (Full 24V)
+const int REVERSE_SPEED = 128; // 50% speed (~12V equivalent PWM)
 
 // =======================================================
 // Calibrated Paper Dispense Cycle Timings
@@ -716,7 +716,7 @@ void loop() {
       motorStop();
       Serial.println("[Motor Test] Finished.");
     } else if (c == 'r') {
-      Serial.println("[Motor Test] Running REVERSE at 100% (24V on D26) for 1.0s...");
+      Serial.println("[Motor Test] Running REVERSE at 50% (~12V on D26) for 1.0s...");
       motorReverse(REVERSE_SPEED);
       delay(1000);
       motorStop();
