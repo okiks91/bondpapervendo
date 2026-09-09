@@ -198,6 +198,13 @@ bool detectAndInitLCD() {
 // =======================================================
 void updateLCD(String l1, String l2, bool force = false) {
   if (!lcdReady) return;
+
+  static unsigned long lastForceRepaintMs = 0;
+  if (millis() - lastForceRepaintMs >= 5000) {
+    force = true;
+    lastForceRepaintMs = millis();
+  }
+
   if (!force && l1 == currentL1 && l2 == currentL2) return;
 
   currentL1 = l1;
@@ -655,6 +662,11 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/motor", HTTP_ANY, handleMotor);
+  server.on("/api/lcd_init", HTTP_ANY, []() {
+    bool ok = detectAndInitLCD();
+    if (ok) refreshLCDScreen();
+    server.send(200, "text/plain", ok ? "LCD Initialized OK" : "LCD Init Failed");
+  });
   server.begin();
   Serial.println("[WebServer] HTTP server started on port 80.");
 
@@ -706,7 +718,10 @@ void loop() {
       for (int i = 0; i < n; ++i) {
         Serial.printf("  %2d: %-32.32s (%4d dBm) %s\n", i + 1, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "ENCRYPTED");
       }
-      Serial.printf("  Current STA status: %d (Connected: %s, IP: %s)\n\n", WiFi.status(), wifiConnected ? "YES" : "NO", localIPStr.c_str());
+    } else if (c == 'l') {
+      Serial.println("\n[LCD] Manual re-initialization requested...");
+      detectAndInitLCD();
+      refreshLCDScreen();
     } else if (c == 't') {
       testBtsPins();
     } else if (c == 'f') {
@@ -834,22 +849,15 @@ void loop() {
     }
   }
 
-  // 4. Periodic LCD synchronization or background auto-reconnect
+  // 4. Periodic LCD synchronization (refresh text without tearing down I2C bus)
   static unsigned long lastLcdSyncMs = 0;
-  if (!lcdReady) {
-    if (millis() - lastLcdSyncMs >= 2000) {
-      lastLcdSyncMs = millis();
-      if (detectAndInitLCD()) {
-        refreshLCDScreen();
-      }
-    }
-  } else if (currentState == STATE_IDLE && !manualMotorActive && millis() - lastLcdSyncMs >= 2000) {
+  if (lcdReady && currentState == STATE_IDLE && !manualMotorActive && millis() - lastLcdSyncMs >= 2000) {
     lastLcdSyncMs = millis();
-    if (isI2CBusHealthy()) {
+    refreshLCDScreen();
+  } else if (!lcdReady && millis() - lastLcdSyncMs >= 3000) {
+    lastLcdSyncMs = millis();
+    if (detectAndInitLCD()) {
       refreshLCDScreen();
-    } else {
-      Serial.println("[LCD] Bus lost connection. Will auto-reconnect.");
-      lcdReady = false;
     }
   }
 }
