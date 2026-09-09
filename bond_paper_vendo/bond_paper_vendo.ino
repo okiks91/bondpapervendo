@@ -20,7 +20,7 @@ int activeSCL            = 33; // I2C Clock line for LCD display (auto-detected)
 // WiFi & Web Server Configuration
 // =======================================================
 const char* WIFI_SSID = "YOTC-329FD5";
-const char* WIFI_PASS = "v0jq634t";
+const char* WIFI_PASS = "MarcAron102705";
 const char* AP_SSID   = "BondPaper-Vendo";
 const char* AP_PASS   = "12345678";
 
@@ -624,11 +624,12 @@ void setup() {
   // =======================================================
   Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   unsigned long wifiStartMs = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStartMs < 7000) {
-    delay(200);
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStartMs < 15000) {
+    delay(300);
     Serial.print(".");
   }
   Serial.println();
@@ -641,7 +642,7 @@ void setup() {
     delay(2000);
   } else {
     wifiConnected = false;
-    Serial.println("[WiFi] Router not reached. Starting Fallback Hotspot (AP)...");
+    Serial.printf("[WiFi] Router not reached (status: %d). Starting Fallback Hotspot (AP)...\n", WiFi.status());
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASS);
     localIPStr = WiFi.softAPIP().toString();
@@ -679,11 +680,33 @@ void loop() {
     }
   }
 
+  // Check if background WiFi STA connected or disconnected
+  if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+    wifiConnected = true;
+    localIPStr = WiFi.localIP().toString();
+    Serial.printf("\n[WiFi] Connected to %s! IP Address: http://%s\n", WIFI_SSID, localIPStr.c_str());
+    updateLCD("WIFI CONNECTED! ", "IP:" + localIPStr, true);
+    delay(1000);
+    refreshLCDScreen();
+  } else if (WiFi.status() != WL_CONNECTED && wifiConnected) {
+    wifiConnected = false;
+    localIPStr = WiFi.softAPIP().toString();
+    Serial.println("\n[WiFi] Connection lost. Fallback to AP active.");
+  }
+
   // Check for Serial status query commands
   if (Serial.available() > 0) {
     char c = Serial.read();
     if (c == 'p' || c == 's' || c == '?') {
       printPinStatus();
+    } else if (c == 'w') {
+      Serial.println("\n[WiFi] Scanning nearby networks...");
+      int n = WiFi.scanNetworks();
+      Serial.printf("[WiFi] Found %d networks:\n", n);
+      for (int i = 0; i < n; ++i) {
+        Serial.printf("  %2d: %-32.32s (%4d dBm) %s\n", i + 1, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "ENCRYPTED");
+      }
+      Serial.printf("  Current STA status: %d (Connected: %s, IP: %s)\n\n", WiFi.status(), wifiConnected ? "YES" : "NO", localIPStr.c_str());
     } else if (c == 't') {
       testBtsPins();
     } else if (c == 'f') {

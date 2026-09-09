@@ -8,7 +8,7 @@
 // WiFi Credentials
 // =======================================================
 const char* ssid     = "YOTC-329FD5";
-const char* password = "v0jq634t";
+const char* password = "MarcAron102705";
 
 // I2C Pins on ESP32
 int activeSDA = 21;

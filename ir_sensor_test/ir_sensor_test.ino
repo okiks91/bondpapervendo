@@ -6,7 +6,7 @@
 // WiFi Credentials
 // =======================================================
 const char* ssid     = "YOTC-329FD5";
-const char* password = "v0jq634t";
+const char* password = "MarcAron102705";
 
 // =======================================================
 // IR Sensor Pin Configuration
