@@ -3,6 +3,8 @@
 #include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 // =======================================================
 // Pin Configuration
@@ -141,16 +143,80 @@ bool isI2CBusHealthy() {
   return (Wire.endTransmission() == 0);
 }
 
+void testI2CPinVoltages() {
+  Wire.end();
+  Serial.println("\n========== I2C ELECTRICAL DIAGNOSTIC ==========");
+  // Test SDA (GPIO 32)
+  pinMode(32, INPUT_PULLUP);
+  delay(5);
+  int sdaPU = digitalRead(32);
+  pinMode(32, INPUT_PULLDOWN);
+  delay(5);
+  int sdaPD = digitalRead(32);
+  pinMode(32, INPUT);
+  delay(5);
+  int sdaFloat = digitalRead(32);
+
+  // Test SCL (GPIO 33)
+  pinMode(33, INPUT_PULLUP);
+  delay(5);
+  int sclPU = digitalRead(33);
+  pinMode(33, INPUT_PULLDOWN);
+  delay(5);
+  int sclPD = digitalRead(33);
+  pinMode(33, INPUT);
+  delay(5);
+  int sclFloat = digitalRead(33);
+
+  // Test GPIO 21 / 22
+  pinMode(21, INPUT_PULLUP);
+  delay(5);
+  int p21PU = digitalRead(21);
+  pinMode(21, INPUT_PULLDOWN);
+  delay(5);
+  int p21PD = digitalRead(21);
+
+  pinMode(22, INPUT_PULLUP);
+  delay(5);
+  int p22PU = digitalRead(22);
+  pinMode(22, INPUT_PULLDOWN);
+  delay(5);
+  int p22PD = digitalRead(22);
+
+  Serial.printf("  GPIO 32 (SDA): PU=%d, PD=%d, RAW=%d -> %s\n", 
+    sdaPU, sdaPD, sdaFloat, 
+    (sdaPU==0 && sdaPD==0) ? "CLAMPED LOW (LCD 5V VCC is OFF or wire shorted to GND!)" :
+    (sdaPU==1 && sdaPD==1) ? "PULLED HIGH OK (LCD 5V VCC is powered on)" : "FLOATING (Wire disconnected)");
+
+  Serial.printf("  GPIO 33 (SCL): PU=%d, PD=%d, RAW=%d -> %s\n", 
+    sclPU, sclPD, sclFloat, 
+    (sclPU==0 && sclPD==0) ? "CLAMPED LOW (LCD 5V VCC is OFF or wire shorted to GND!)" :
+    (sclPU==1 && sclPD==1) ? "PULLED HIGH OK (LCD 5V VCC is powered on)" : "FLOATING (Wire disconnected)");
+
+  Serial.printf("  GPIO 21 (D21): PU=%d, PD=%d\n", p21PU, p21PD);
+  Serial.printf("  GPIO 22 (D22): PU=%d, PD=%d\n", p22PU, p22PD);
+  Serial.println("================================================\n");
+
+  Wire.begin(activeSDA, activeSCL);
+}
+
 bool probeI2CPair(int sda, int scl, uint8_t &outAddr) {
   Wire.end();
   pinMode(sda, INPUT_PULLUP);
   pinMode(scl, INPUT_PULLUP);
-  delay(5);
+  delay(10);
+
+  // An I2C bus MUST idle HIGH when pullups are present.
+  // If either line is LOW, the bus is grounded, shorted, or the LCD is unpowered!
+  if (digitalRead(sda) == LOW || digitalRead(scl) == LOW) {
+    return false;
+  }
+
   Wire.begin(sda, scl);
   Wire.setClock(100000);
   Wire.setTimeOut(30);
 
-  const uint8_t candidates[] = {0x27, 0x3F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E};
+  const uint8_t candidates[] = {0x27, 0x3F, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26};
   for (uint8_t a : candidates) {
     Wire.beginTransmission(a);
     if (Wire.endTransmission() == 0) {
@@ -161,34 +227,139 @@ bool probeI2CPair(int sda, int scl, uint8_t &outAddr) {
   return false;
 }
 
+// =======================================================
+// Direct Low-Level HD44780 over PCF8574 Initializer
+// =======================================================
+// NOTE: We DO NOT use LiquidCrystal_I2C::init() because that library function
+// hardcodes 'Wire.begin()' with no arguments, which on ESP32 forces TwoWire
+// back to default GPIO 21/22 and blasts 4-bit wake-up nibbles into thin air,
+// leaving an LCD on GPIO 32/33 in an uninitialized 8-bit state upon cold boot!
+void lcdSendNibbleRaw(uint8_t addr, uint8_t nibble, bool rs, bool backlight) {
+  uint8_t bl = backlight ? 0x08 : 0x00;
+  uint8_t rsBit = rs ? 0x01 : 0x00;
+  uint8_t val = (nibble & 0xF0) | bl | rsBit;
+
+  // Pulse Enable (Bit 2 = 0x04) HIGH then LOW
+  Wire.beginTransmission(addr);
+  Wire.write(val | 0x04);
+  Wire.endTransmission();
+  delayMicroseconds(2); // Enable pulse width > 450ns
+
+  Wire.beginTransmission(addr);
+  Wire.write(val & ~0x04);
+  Wire.endTransmission();
+  delayMicroseconds(50); // Command execution wait > 37us
+}
+
+void lcdSendCommandRaw(uint8_t addr, uint8_t cmd, bool backlight = true) {
+  lcdSendNibbleRaw(addr, cmd & 0xF0, false, backlight);
+  lcdSendNibbleRaw(addr, (cmd << 4) & 0xF0, false, backlight);
+}
+
+bool initHD44780Direct(uint8_t addr, int sda, int scl) {
+  Wire.begin(sda, scl);
+  Wire.setClock(100000);
+  Wire.setTimeOut(50);
+
+  // 1. Wait for LCD power rail to stabilize (HD44780 requires at least 40ms after VCC > 4.5V)
+  delay(100);
+
+  // Check if PCF8574 responds on this address
+  Wire.beginTransmission(addr);
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+
+  // Turn on backlight expander bit
+  Wire.beginTransmission(addr);
+  Wire.write(0x08);
+  Wire.endTransmission();
+  delay(10);
+
+  // 2. Hardware 4-Bit Reset Sequence (Hitachi HD44780 Table 24)
+  // Step 1: Send 0x30
+  lcdSendNibbleRaw(addr, 0x30, false, true);
+  delay(6); // Wait > 4.1ms
+
+  // Step 2: Send 0x30
+  lcdSendNibbleRaw(addr, 0x30, false, true);
+  delay(6); // Wait > 100us
+
+  // Step 3: Send 0x30
+  lcdSendNibbleRaw(addr, 0x30, false, true);
+  delay(2);
+
+  // Step 4: Switch to 4-bit interface: Send 0x20
+  lcdSendNibbleRaw(addr, 0x20, false, true);
+  delay(2);
+
+  // 3. Now in 4-bit mode! Configure display settings:
+  // Step 5: Function Set: 4-bit, 2 lines, 5x8 font (0x28)
+  lcdSendCommandRaw(addr, 0x28, true);
+  delay(2);
+
+  // Step 6: Display ON, Cursor OFF, Blink OFF (0x0C)
+  lcdSendCommandRaw(addr, 0x0C, true);
+  delay(2);
+
+  // Step 7: Clear Display (0x01)
+  lcdSendCommandRaw(addr, 0x01, true);
+  delay(5); // Clear needs > 1.52ms
+
+  // Step 8: Entry Mode Set: Increment cursor, No shift (0x06)
+  lcdSendCommandRaw(addr, 0x06, true);
+  delay(2);
+
+  return true;
+}
+
 bool detectAndInitLCD() {
   const int pairs[][2] = {
-    {32, 33},
-    {33, 32},
-    {21, 22},
+    {32, 33}, // Primary wiring: SDA=32, SCL=33
+    {21, 22}, // Standard ESP32 pins: SDA=21, SCL=22
+    {33, 32}, // In case SDA/SCL were reversed
     {22, 21}
   };
 
   uint8_t foundAddr = 0;
+  int foundSDA = -1;
+  int foundSCL = -1;
+
   for (auto &pair : pairs) {
     int s = pair[0];
     int c = pair[1];
-    if (probeI2CPair(s, c, foundAddr)) {
-      activeSDA = s;
-      activeSCL = c;
-      activeLcdAddr = foundAddr;
-      Serial.printf("[LCD] SUCCESS! LCD found at 0x%02X on SDA=%d, SCL=%d!\n", activeLcdAddr, activeSDA, activeSCL);
+    for (int attempt = 0; attempt < 3; attempt++) {
+      if (probeI2CPair(s, c, foundAddr)) {
+        foundSDA = s;
+        foundSCL = c;
+        break;
+      }
+      delay(30);
+    }
+    if (foundAddr != 0) break;
+  }
 
+  if (foundAddr != 0) {
+    activeSDA = foundSDA;
+    activeSCL = foundSCL;
+    activeLcdAddr = foundAddr;
+    Serial.printf("[LCD] SUCCESS! LCD found at 0x%02X on SDA=%d, SCL=%d!\n", activeLcdAddr, activeSDA, activeSCL);
+
+    // Direct hardware HD44780 reset and 4-bit configuration on custom pins
+    if (initHD44780Direct(activeLcdAddr, activeSDA, activeSCL)) {
       lcd = LiquidCrystal_I2C(activeLcdAddr, 16, 2);
-      lcd.init();
-      Wire.begin(activeSDA, activeSCL);
-      Wire.setClock(100000);
-      Wire.setTimeOut(50);
+      // NOTE: Do NOT call lcd.init()! It calls Wire.begin() with no args which reroutes to GPIO 21/22!
+      lcd.begin(16, 2);
       lcd.backlight();
       lcd.clear();
       lcdReady = true;
+      Serial.println("[LCD] HD44780 Controller configured in 4-bit mode successfully!");
       return true;
+    } else {
+      Serial.println("[LCD ERROR] Failed to send initialization commands to HD44780!");
     }
+  } else {
+    Serial.println("[LCD WARNING] No I2C backpack detected on pins 32/33 or 21/22.");
   }
   return false;
 }
@@ -587,8 +758,9 @@ void handleMotor() {
 // Setup
 // =======================================================
 void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector to prevent reboot loops on USB/cold boot
   Serial.begin(115200);
-  delay(500);
+  delay(1000); // 1s power rail stabilization on cold boot
 
   Serial.println("\n==========================================");
   Serial.println(" Bond Paper Vendo Machine (Connected)     ");
@@ -614,11 +786,7 @@ void setup() {
   // Initialize I2C with internal pullups
   pinMode(activeSDA, INPUT_PULLUP);
   pinMode(activeSCL, INPUT_PULLUP);
-  delay(10);
-
-  // Print all live pin statuses
-  printPinStatus();
-  testBtsPins();
+  delay(50);
 
   if (detectAndInitLCD()) {
     updateLCD("STARTING VENDO..", "CONNECTING WIFI ", true);
@@ -626,11 +794,15 @@ void setup() {
     Serial.println("[LCD] Not detected on standard pin pairs. Background auto-scan active.");
   }
 
+  // Print all live pin statuses
+  printPinStatus();
+
   // =======================================================
   // WiFi Connection with Auto Fallback Hotspot
   // =======================================================
   Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
   WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_15dBm); // Prevent peak current surge from browning out power rails
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
@@ -711,6 +883,8 @@ void loop() {
     char c = Serial.read();
     if (c == 'p' || c == 's' || c == '?') {
       printPinStatus();
+    } else if (c == 'i') {
+      testI2CPinVoltages();
     } else if (c == 'w') {
       Serial.println("\n[WiFi] Scanning nearby networks...");
       int n = WiFi.scanNetworks();
@@ -722,6 +896,18 @@ void loop() {
       Serial.println("\n[LCD] Manual re-initialization requested...");
       detectAndInitLCD();
       refreshLCDScreen();
+    } else if (c == 'b') {
+      Serial.println("\n[LCD Test] Blinking backlight and printing test text...");
+      if (lcdReady) {
+        lcd.noBacklight();
+        delay(400);
+        lcd.backlight();
+        delay(200);
+        updateLCD("LCD TEST OK!    ", "1234567890ABCDEF", true);
+        Serial.println("[LCD Test] Test pattern written to LCD!");
+      } else {
+        Serial.println("[LCD Test] LCD not ready!");
+      }
     } else if (c == 't') {
       testBtsPins();
     } else if (c == 'f') {
