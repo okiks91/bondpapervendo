@@ -1,8 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <WiFi.h>
-#include <WebServer.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
@@ -10,25 +8,13 @@
 // Pin Configuration
 // =======================================================
 const int COIN_PIN       = 18; // Allan Coin Selector pulse input (via 1N4007)
-const int RPWM_PIN       = 27; // Forward speed (PWM) moved to D27!
+const int RPWM_PIN       = 27; // Forward speed (PWM) on D27
 const int LPWM_PIN       = 26; // Reverse speed (PWM) on D26
 const int REN_PIN        = -1; // Unused (R_EN and L_EN jumpered to VCC on BTS7960)
 const int BUTTON_PIN     = 23; // Physical Push Button (Active-HIGH with INPUT_PULLDOWN)
 const int BUTTON_PWR_PIN = 19; // Provides 3.3V source for button (OUTPUT HIGH)
 int activeSDA            = 32; // Primary I2C Data line (GPIO 32)
 int activeSCL            = 33; // Primary I2C Clock line (GPIO 33)
-
-// =======================================================
-// WiFi & Web Server Configuration
-// =======================================================
-const char* WIFI_SSID = "YOTC-329FD5";
-const char* WIFI_PASS = "MarcAron102705";
-const char* AP_SSID   = "BondPaper-Vendo";
-const char* AP_PASS   = "12345678";
-
-WebServer server(80);
-bool wifiConnected = false;
-String localIPStr = "";
 
 // =======================================================
 // LCD Display Manager (Address 0x27, 16x2)
@@ -85,11 +71,6 @@ int totalEarningsPHP = 0;     // Total revenue
 int paperRemaining = 50;      // Smart paper inventory tracker
 const int TRAY_CAPACITY = 50; // Tray capacity
 
-// Manual Web Motor Control
-bool manualMotorActive = false;
-unsigned long manualMotorStartMs = 0;
-unsigned long manualMotorDuration = 0; // 0 = runs until stop (max 8s safety timeout), >0 = timed burst
-
 // =======================================================
 // Pulse Width Verification ISR (Rejects Electrical Noise)
 // =======================================================
@@ -119,7 +100,6 @@ void motorStop() {
   analogWrite(RPWM_PIN, 0);
   analogWrite(LPWM_PIN, 0);
   if (REN_PIN >= 0) digitalWrite(REN_PIN, LOW);
-  manualMotorActive = false;
 }
 
 void motorForward(int speed) {
@@ -230,10 +210,6 @@ bool probeI2CPair(int sda, int scl, uint8_t &outAddr) {
 // =======================================================
 // Direct Low-Level HD44780 over PCF8574 Initializer
 // =======================================================
-// NOTE: We DO NOT use LiquidCrystal_I2C::init() because that library function
-// hardcodes 'Wire.begin()' with no arguments, which on ESP32 forces TwoWire
-// back to default GPIO 21/22 and blasts 4-bit wake-up nibbles into thin air,
-// leaving an LCD on GPIO 32/33 in an uninitialized 8-bit state upon cold boot!
 void lcdSendNibbleRaw(uint8_t addr, uint8_t nibble, bool rs, bool backlight) {
   uint8_t bl = backlight ? 0x08 : 0x00;
   uint8_t rsBit = rs ? 0x01 : 0x00;
@@ -261,52 +237,44 @@ bool initHD44780Direct(uint8_t addr, int sda, int scl) {
   Wire.setClock(100000);
   Wire.setTimeOut(50);
 
-  // 1. Wait for LCD power rail to stabilize (HD44780 requires at least 40ms after VCC > 4.5V)
   delay(100);
 
-  // Check if PCF8574 responds on this address
   Wire.beginTransmission(addr);
   if (Wire.endTransmission() != 0) {
     return false;
   }
 
-  // Turn on backlight expander bit
+  // Backlight ON
   Wire.beginTransmission(addr);
   Wire.write(0x08);
   Wire.endTransmission();
   delay(10);
 
-  // 2. Hardware 4-Bit Reset Sequence (Hitachi HD44780 Table 24)
-  // Step 1: Send 0x30
+  // Hardware 4-Bit Reset Sequence (Hitachi HD44780 Table 24)
   lcdSendNibbleRaw(addr, 0x30, false, true);
-  delay(6); // Wait > 4.1ms
-
-  // Step 2: Send 0x30
+  delay(6);
   lcdSendNibbleRaw(addr, 0x30, false, true);
-  delay(6); // Wait > 100us
-
-  // Step 3: Send 0x30
+  delay(6);
   lcdSendNibbleRaw(addr, 0x30, false, true);
   delay(2);
 
-  // Step 4: Switch to 4-bit interface: Send 0x20
+  // Switch to 4-bit interface
   lcdSendNibbleRaw(addr, 0x20, false, true);
   delay(2);
 
-  // 3. Now in 4-bit mode! Configure display settings:
-  // Step 5: Function Set: 4-bit, 2 lines, 5x8 font (0x28)
+  // Function Set: 4-bit, 2 lines, 5x8 font (0x28)
   lcdSendCommandRaw(addr, 0x28, true);
   delay(2);
 
-  // Step 6: Display ON, Cursor OFF, Blink OFF (0x0C)
+  // Display ON, Cursor OFF, Blink OFF (0x0C)
   lcdSendCommandRaw(addr, 0x0C, true);
   delay(2);
 
-  // Step 7: Clear Display (0x01)
+  // Clear Display (0x01)
   lcdSendCommandRaw(addr, 0x01, true);
-  delay(5); // Clear needs > 1.52ms
+  delay(5);
 
-  // Step 8: Entry Mode Set: Increment cursor, No shift (0x06)
+  // Entry Mode Set: Increment cursor, No shift (0x06)
   lcdSendCommandRaw(addr, 0x06, true);
   delay(2);
 
@@ -345,10 +313,8 @@ bool detectAndInitLCD() {
     activeLcdAddr = foundAddr;
     Serial.printf("[LCD] SUCCESS! LCD found at 0x%02X on SDA=%d, SCL=%d!\n", activeLcdAddr, activeSDA, activeSCL);
 
-    // Direct hardware HD44780 reset and 4-bit configuration on custom pins
     if (initHD44780Direct(activeLcdAddr, activeSDA, activeSCL)) {
       lcd = LiquidCrystal_I2C(activeLcdAddr, 16, 2);
-      // NOTE: Do NOT call lcd.init()! It calls Wire.begin() with no args which reroutes to GPIO 21/22!
       lcd.begin(16, 2);
       lcd.backlight();
       lcd.clear();
@@ -456,7 +422,6 @@ void printPinStatus() {
   Serial.printf("  I2C_SDA_PIN    (GPIO %2d): %s (%s)\n", activeSDA, sdaVal ? "HIGH" : "LOW ", sdaVal ? "3.3V Pullup OK" : "LOW (Grounded / Shorted)");
   Serial.printf("  I2C_SCL_PIN    (GPIO %2d): %s (%s)\n", activeSCL, sclVal ? "HIGH" : "LOW ", sclVal ? "3.3V Pullup OK" : "LOW (Grounded / Shorted)");
   Serial.printf("  LCD Display                 : %s (Addr: 0x%02X, SDA=%d, SCL=%d)\n", lcdReady ? "ACTIVE / DISPLAYING" : "NOT DETECTED", activeLcdAddr, activeSDA, activeSCL);
-  Serial.printf("  WiFi Status                 : %s (IP: %s)\n", wifiConnected ? "CONNECTED" : "AP HOTSPOT", localIPStr.c_str());
   Serial.println("===========================================\n");
 }
 
@@ -481,289 +446,15 @@ void testBtsPins() {
 }
 
 // =======================================================
-// Web Dashboard HTML (Dark Mode, Responsive, Real-Time)
-// =======================================================
-const char INDEX_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Bond Paper Vendo Control</title>
-  <style>
-    :root {
-      --bg: #0f172a;
-      --card: #1e293b;
-      --border: #334155;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --green: #22c55e;
-      --blue: #3b82f6;
-      --red: #ef4444;
-      --yellow: #f59e0b;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { background: var(--bg); color: var(--text); padding: 16px; display: flex; justify-content: center; }
-    .container { width: 100%; max-width: 580px; display: flex; flex-direction: column; gap: 16px; }
-    
-    header { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; display: flex; justify-content: space-between; align-items: center; }
-    .title h1 { font-size: 1.25rem; font-weight: 700; color: #fff; }
-    .title p { font-size: 0.82rem; color: var(--muted); margin-top: 2px; }
-    .badge { font-size: 0.75rem; padding: 4px 10px; border-radius: 9999px; background: rgba(34, 197, 94, 0.2); color: var(--green); border: 1px solid var(--green); font-weight: 600; }
-
-    .grid-stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
-    .stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
-    .stat-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
-    .stat-val { font-size: 1.5rem; font-weight: 700; color: #fff; margin-top: 4px; }
-
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
-    .card h2 { font-size: 0.95rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 14px; color: var(--muted); }
-
-    .btn-group { display: flex; flex-direction: column; gap: 10px; }
-    .btn-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    
-    button {
-      border: none;
-      border-radius: 10px;
-      padding: 15px;
-      font-size: 1rem;
-      font-weight: 700;
-      color: #fff;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      transition: filter 0.15s, transform 0.1s;
-      user-select: none;
-      -webkit-user-select: none;
-    }
-    button:active { transform: scale(0.98); filter: brightness(1.2); }
-    
-    .btn-fwd { background: var(--green); }
-    .btn-rev { background: var(--blue); }
-    .btn-stop { background: var(--red); grid-column: span 2; padding: 16px; font-size: 1.1rem; }
-    .btn-dispense { background: linear-gradient(135deg, #3b82f6, #8b5cf6); padding: 16px; font-size: 1.1rem; }
-    .btn-credit { background: #334155; }
-    .btn-refill { background: #475569; }
-
-    .pulse-btn { background: #1e293b; border: 1px solid var(--border); color: #cbd5e1; padding: 10px; font-size: 0.85rem; }
-    .pulse-btn:hover { background: #334155; }
-
-    footer { text-align: center; font-size: 0.75rem; color: var(--muted); margin-top: 10px; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <div class="title">
-        <h1>Bond Paper Vendo</h1>
-        <p id="ip-display">Connecting...</p>
-      </div>
-      <div class="badge" id="conn-badge">ONLINE</div>
-    </header>
-
-    <div class="grid-stats">
-      <div class="stat-card">
-        <div class="stat-label">Paper Tray</div>
-        <div class="stat-val" id="stat-paper">-- / 50</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Credit (PHP)</div>
-        <div class="stat-val" style="color: var(--green);" id="stat-credit">P0.00</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Dispense Queue</div>
-        <div class="stat-val" style="color: var(--yellow);" id="stat-queue">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-label">Motor State</div>
-        <div class="stat-val" style="font-size: 1.1rem; margin-top: 8px;" id="stat-state">IDLE</div>
-      </div>
-    </div>
-
-    <!-- Manual Motor Controls -->
-    <div class="card">
-      <h2>Manual Motor Control (24V BTS7960)</h2>
-      <div class="btn-group">
-        <div class="btn-row">
-          <button class="btn-fwd" onclick="sendAction('forward')">
-            &#9654; FORWARD (D27)
-          </button>
-          <button class="btn-rev" onclick="sendAction('reverse')">
-            &#9664; REVERSE (D26)
-          </button>
-        </div>
-        <button class="btn-stop" onclick="sendAction('stop')">
-          &#9632; EMERGENCY STOP
-        </button>
-        <div class="btn-row" style="margin-top: 4px;">
-          <button class="pulse-btn" onclick="sendAction('pulse_forward')">&#9654; Pulse Fwd 1.5s</button>
-          <button class="pulse-btn" onclick="sendAction('pulse_reverse')">&#9664; Pulse Rev 0.5s</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Vendo Actions -->
-    <div class="card">
-      <h2>Vendo Actions</h2>
-      <div class="btn-group">
-        <button class="btn-dispense" onclick="sendAction('dispense')">
-          &#128196; DISPENSE 1 SHEET NOW
-        </button>
-        <div class="btn-row">
-          <button class="btn-credit" onclick="addCredit(1)">+ P1.00</button>
-          <button class="btn-credit" onclick="addCredit(5)">+ P5.00</button>
-        </div>
-        <button class="btn-refill" onclick="sendAction('refill')">
-          &#128230; Refill Paper Tray (50 Pcs)
-        </button>
-      </div>
-    </div>
-
-    <footer>
-      Standalone Bond Paper Vendo &bull; ESP32 &bull; BTS7960 24V (RPWM=D27, LPWM=D26)
-    </footer>
-  </div>
-
-  <script>
-    function sendAction(action) {
-      fetch('/api/motor?action=' + encodeURIComponent(action), { method: 'POST' })
-        .then(r => r.json())
-        .then(d => updateUI(d))
-        .catch(e => console.error(e));
-    }
-
-    function addCredit(amt) {
-      fetch('/api/motor?action=add_credit&amount=' + amt, { method: 'POST' })
-        .then(r => r.json())
-        .then(d => updateUI(d))
-        .catch(e => console.error(e));
-    }
-
-    function pollStatus() {
-      fetch('/api/status')
-        .then(r => r.json())
-        .then(d => updateUI(d))
-        .catch(e => {
-          document.getElementById('conn-badge').textContent = 'OFFLINE';
-          document.getElementById('conn-badge').style.color = '#ef4444';
-          document.getElementById('conn-badge').style.borderColor = '#ef4444';
-        });
-    }
-
-    function updateUI(d) {
-      if (!d) return;
-      document.getElementById('conn-badge').textContent = 'ONLINE';
-      document.getElementById('conn-badge').style.color = 'var(--green)';
-      document.getElementById('conn-badge').style.borderColor = 'var(--green)';
-      document.getElementById('ip-display').textContent = (d.wifi || 'WiFi') + ' • ' + (d.ip || '');
-      document.getElementById('stat-paper').textContent = d.paper + ' / 50';
-      document.getElementById('stat-credit').textContent = 'P' + d.credit + '.00';
-      document.getElementById('stat-queue').textContent = d.queue + ' pcs';
-      
-      let st = d.state;
-      if (d.manual && d.manual !== '') st = 'MANUAL ' + d.manual;
-      document.getElementById('stat-state').textContent = st;
-      document.getElementById('stat-state').style.color = (st === 'IDLE') ? '#fff' : 'var(--green)';
-    }
-
-    setInterval(pollStatus, 1000);
-    pollStatus();
-  </script>
-</body>
-</html>
-)rawliteral";
-
-// =======================================================
-// Web Server Route Handlers
-// =======================================================
-void handleRoot() {
-  server.send_P(200, "text/html", INDEX_HTML);
-}
-
-void handleStatus() {
-  String stateStr = "IDLE";
-  if (currentState == STATE_REVERSE) stateStr = "REVERSING";
-  else if (currentState == STATE_FORWARD) stateStr = "FORWARDING";
-  else if (currentState == STATE_PAUSE) stateStr = "PAUSING";
-
-  String manualStr = "";
-  if (manualMotorActive) {
-    if (digitalRead(RPWM_PIN) == HIGH) manualStr = "FWD 100%";
-    else if (digitalRead(LPWM_PIN) == HIGH) manualStr = "REV 100%";
-  }
-
-  String json = "{";
-  json += "\"credit\":" + String(insertedCredit) + ",";
-  json += "\"queue\":" + String(sheetsQueue) + ",";
-  json += "\"paper\":" + String(paperRemaining) + ",";
-  json += "\"dispensed\":" + String(totalSheetsDispensed) + ",";
-  json += "\"earnings\":" + String(totalEarningsPHP) + ",";
-  json += "\"state\":\"" + stateStr + "\",";
-  json += "\"manual\":\"" + manualStr + "\",";
-  json += "\"ip\":\"" + localIPStr + "\",";
-  json += "\"wifi\":\"" + String(wifiConnected ? WIFI_SSID : AP_SSID) + "\"";
-  json += "}";
-
-  server.send(200, "application/json", json);
-}
-
-void handleMotor() {
-  String action = server.hasArg("action") ? server.arg("action") : "";
-  Serial.printf("[WebAPI] Action: %s\n", action.c_str());
-
-  if (action == "forward") {
-    motorForward(FORWARD_SPEED);
-    manualMotorActive = true;
-    manualMotorStartMs = millis();
-    manualMotorDuration = 0; // runs until stopped or 8s safety timeout
-  } else if (action == "reverse") {
-    motorReverse(REVERSE_SPEED);
-    manualMotorActive = true;
-    manualMotorStartMs = millis();
-    manualMotorDuration = 0;
-  } else if (action == "stop") {
-    motorStop();
-    manualMotorActive = false;
-  } else if (action == "pulse_forward") {
-    motorForward(FORWARD_SPEED);
-    manualMotorActive = true;
-    manualMotorStartMs = millis();
-    manualMotorDuration = 1500; // 1.5s burst
-  } else if (action == "pulse_reverse") {
-    motorReverse(REVERSE_SPEED);
-    manualMotorActive = true;
-    manualMotorStartMs = millis();
-    manualMotorDuration = 500; // 0.5s burst
-  } else if (action == "dispense") {
-    if (paperRemaining > 0 && sheetsQueue == 0) {
-      sheetsQueue = 1;
-      Serial.println("[WebAPI] Dispense 1 sheet initiated.");
-      refreshLCDScreen();
-    }
-  } else if (action == "add_credit") {
-    int amt = server.hasArg("amount") ? server.arg("amount").toInt() : 1;
-    insertedCredit += amt;
-    totalEarningsPHP += amt;
-    refreshLCDScreen();
-  } else if (action == "refill") {
-    refillPaper();
-  }
-
-  handleStatus();
-}
-
-// =======================================================
 // Setup
 // =======================================================
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector to prevent reboot loops on USB/cold boot
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector
   Serial.begin(115200);
-  delay(1000); // 1s power rail stabilization on cold boot
+  delay(500); // 0.5s power rail stabilization on cold boot
 
   Serial.println("\n==========================================");
-  Serial.println(" Bond Paper Vendo Machine (Connected)     ");
+  Serial.println(" Bond Paper Vendo Machine (Standalone)    ");
   Serial.println(" Allan Slot + BTS7960 (D27/D26) + LCD     ");
   Serial.println("==========================================");
 
@@ -789,7 +480,7 @@ void setup() {
   delay(50);
 
   if (detectAndInitLCD()) {
-    updateLCD("STARTING VENDO..", "CONNECTING WIFI ", true);
+    updateLCD("BOND PAPER VENDO", "READY TO DISPENSE", true);
   } else {
     Serial.println("[LCD] Not detected on standard pin pairs. Background auto-scan active.");
   }
@@ -797,87 +488,14 @@ void setup() {
   // Print all live pin statuses
   printPinStatus();
 
-  // =======================================================
-  // WiFi Connection with Auto Fallback Hotspot
-  // =======================================================
-  Serial.printf("[WiFi] Connecting to %s...\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_15dBm); // Prevent peak current surge from browning out power rails
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  unsigned long wifiStartMs = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStartMs < 15000) {
-    delay(300);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    localIPStr = WiFi.localIP().toString();
-    Serial.printf("[WiFi] CONNECTED! IP Address: http://%s\n", localIPStr.c_str());
-    updateLCD("WIFI CONNECTED! ", "IP:" + localIPStr, true);
-    delay(2000);
-  } else {
-    wifiConnected = false;
-    Serial.printf("[WiFi] Router not reached (status: %d). Starting Fallback Hotspot (AP)...\n", WiFi.status());
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(AP_SSID, AP_PASS);
-    localIPStr = WiFi.softAPIP().toString();
-    Serial.printf("[WiFi AP] Hotspot '%s' active. Open http://%s\n", AP_SSID, localIPStr.c_str());
-    updateLCD("AP:" + String(AP_SSID).substring(0, 13), "IP:" + localIPStr, true);
-    delay(2000);
-  }
-
-  // Start Web Server
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/api/status", HTTP_GET, handleStatus);
-  server.on("/api/motor", HTTP_ANY, handleMotor);
-  server.on("/api/lcd_init", HTTP_ANY, []() {
-    bool ok = detectAndInitLCD();
-    if (ok) refreshLCDScreen();
-    server.send(200, "text/plain", ok ? "LCD Initialized OK" : "LCD Init Failed");
-  });
-  server.begin();
-  Serial.println("[WebServer] HTTP server started on port 80.");
-
   refreshLCDScreen();
-  Serial.println("[Vendo] System initialized and ready for coins & web commands.");
+  Serial.println("[Vendo] System initialized and ready for coins.");
 }
 
 // =======================================================
 // Main Loop
 // =======================================================
 void loop() {
-  // 0. Handle Web Server Requests
-  server.handleClient();
-
-  // Safety timer for manual motor control
-  if (manualMotorActive) {
-    unsigned long elapsed = millis() - manualMotorStartMs;
-    if (manualMotorDuration > 0 && elapsed >= manualMotorDuration) {
-      motorStop();
-    } else if (manualMotorDuration == 0 && elapsed >= 8000) {
-      Serial.println("[Safety] Manual motor timeout (8s). Stopping.");
-      motorStop();
-    }
-  }
-
-  // Check if background WiFi STA connected or disconnected
-  if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
-    wifiConnected = true;
-    localIPStr = WiFi.localIP().toString();
-    Serial.printf("\n[WiFi] Connected to %s! IP Address: http://%s\n", WIFI_SSID, localIPStr.c_str());
-    updateLCD("WIFI CONNECTED! ", "IP:" + localIPStr, true);
-    delay(1000);
-    refreshLCDScreen();
-  } else if (WiFi.status() != WL_CONNECTED && wifiConnected) {
-    wifiConnected = false;
-    localIPStr = WiFi.softAPIP().toString();
-    Serial.println("\n[WiFi] Connection lost. Fallback to AP active.");
-  }
-
   // Check for Serial status query commands
   if (Serial.available() > 0) {
     char c = Serial.read();
@@ -885,13 +503,6 @@ void loop() {
       printPinStatus();
     } else if (c == 'i') {
       testI2CPinVoltages();
-    } else if (c == 'w') {
-      Serial.println("\n[WiFi] Scanning nearby networks...");
-      int n = WiFi.scanNetworks();
-      Serial.printf("[WiFi] Found %d networks:\n", n);
-      for (int i = 0; i < n; ++i) {
-        Serial.printf("  %2d: %-32.32s (%4d dBm) %s\n", i + 1, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "OPEN" : "ENCRYPTED");
-      }
     } else if (c == 'l') {
       Serial.println("\n[LCD] Manual re-initialization requested...");
       detectAndInitLCD();
@@ -944,7 +555,7 @@ void loop() {
       Serial.println("------------------------------------------");
       Serial.printf(">> Coin Inserted : P%d.00\n", insertedPesos);
       Serial.printf(">> Total Credit  : P%d.00 (%d Sheets)\n", insertedCredit, insertedCredit);
-      Serial.println(">> (Press physical button or web to dispense)");
+      Serial.println(">> (Press physical button to dispense)");
       Serial.println("------------------------------------------");
     }
   }
@@ -975,69 +586,67 @@ void loop() {
     }
   }
 
-  // 3. Dispenser State Machine (Runs when sheetsQueue > 0 and manual motor is not overriding)
-  if (!manualMotorActive) {
-    unsigned long now = millis();
+  // 3. Dispenser State Machine (Runs when sheetsQueue > 0)
+  unsigned long now = millis();
 
-    switch (currentState) {
-      case STATE_IDLE:
+  switch (currentState) {
+    case STATE_IDLE:
+      if (sheetsQueue > 0) {
+        Serial.printf("[Dispenser] Dispensing sheet #%d...\n", totalSheetsDispensed + 1);
+        currentState = STATE_REVERSE;
+        stateStartTime = now;
+        motorReverse(REVERSE_SPEED); // Step 1: 0.15s Reverse (cam engagement at 50% PWM)
+        refreshLCDScreen();
+      }
+      break;
+
+    case STATE_REVERSE:
+      if (now - stateStartTime >= REVERSE_TIME_MS) {
+        currentState = STATE_FORWARD;
+        stateStartTime = now;
+        motorForward(FORWARD_SPEED); // Step 2: Forward (paper feed at 100% PWM)
+      }
+      break;
+
+    case STATE_FORWARD: {
+      unsigned long targetForwardTime = (sheetsQueue <= 1) ? LAST_FORWARD_TIME_MS : FORWARD_TIME_MS;
+      if (now - stateStartTime >= targetForwardTime) {
+        motorStop();
+        sheetsQueue--;
+        totalSheetsDispensed++;
+        if (paperRemaining > 0) paperRemaining--;
+        refreshLCDScreen();
+
+        Serial.printf("[Dispenser] Finished sheet #%d! Remaining in queue: %d (Tray Paper: %d)\n", 
+                      totalSheetsDispensed, sheetsQueue, paperRemaining);
+
+        currentState = STATE_PAUSE;
+        stateStartTime = now;
+      }
+      break;
+    }
+
+    case STATE_PAUSE:
+      if (now - stateStartTime >= PAUSE_BETWEEN_MS) {
         if (sheetsQueue > 0) {
-          Serial.printf("[Dispenser] Dispensing sheet #%d...\n", totalSheetsDispensed + 1);
           currentState = STATE_REVERSE;
           stateStartTime = now;
-          motorReverse(REVERSE_SPEED); // Step 1: 0.15s Reverse (cam engagement)
+          motorReverse(REVERSE_SPEED);
+          refreshLCDScreen();
+        } else {
+          currentState = STATE_IDLE;
+          Serial.println("[Dispenser] Finished all queued sheets. Ready for next order.");
+          updateLCD("TAKE YOUR PAPER ", "  THANK YOU!    ", true);
+          delay(1200);
           refreshLCDScreen();
         }
-        break;
-
-      case STATE_REVERSE:
-        if (now - stateStartTime >= REVERSE_TIME_MS) {
-          currentState = STATE_FORWARD;
-          stateStartTime = now;
-          motorForward(FORWARD_SPEED); // Step 2: Forward (paper feed)
-        }
-        break;
-
-      case STATE_FORWARD: {
-        unsigned long targetForwardTime = (sheetsQueue <= 1) ? LAST_FORWARD_TIME_MS : FORWARD_TIME_MS;
-        if (now - stateStartTime >= targetForwardTime) {
-          motorStop();
-          sheetsQueue--;
-          totalSheetsDispensed++;
-          if (paperRemaining > 0) paperRemaining--;
-          refreshLCDScreen();
-
-          Serial.printf("[Dispenser] Finished sheet #%d! Remaining in queue: %d (Tray Paper: %d)\n", 
-                        totalSheetsDispensed, sheetsQueue, paperRemaining);
-
-          currentState = STATE_PAUSE;
-          stateStartTime = now;
-        }
-        break;
       }
-
-      case STATE_PAUSE:
-        if (now - stateStartTime >= PAUSE_BETWEEN_MS) {
-          if (sheetsQueue > 0) {
-            currentState = STATE_REVERSE;
-            stateStartTime = now;
-            motorReverse(REVERSE_SPEED);
-            refreshLCDScreen();
-          } else {
-            currentState = STATE_IDLE;
-            Serial.println("[Dispenser] Finished all queued sheets. Ready for next order.");
-            updateLCD("TAKE YOUR PAPER ", "  THANK YOU!    ", true);
-            delay(1200);
-            refreshLCDScreen();
-          }
-        }
-        break;
-    }
+      break;
   }
 
   // 4. Periodic LCD synchronization (refresh text without tearing down I2C bus)
   static unsigned long lastLcdSyncMs = 0;
-  if (lcdReady && currentState == STATE_IDLE && !manualMotorActive && millis() - lastLcdSyncMs >= 2000) {
+  if (lcdReady && currentState == STATE_IDLE && millis() - lastLcdSyncMs >= 2000) {
     lastLcdSyncMs = millis();
     refreshLCDScreen();
   } else if (!lcdReady && millis() - lastLcdSyncMs >= 3000) {
