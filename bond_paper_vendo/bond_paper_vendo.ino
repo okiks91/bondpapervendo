@@ -15,8 +15,8 @@ const int LPWM_PIN       = 26; // Reverse speed (PWM) on D26
 const int REN_PIN        = -1; // Unused (R_EN and L_EN jumpered to VCC on BTS7960)
 const int BUTTON_PIN     = 23; // Physical Push Button (Active-HIGH with INPUT_PULLDOWN)
 const int BUTTON_PWR_PIN = 19; // Provides 3.3V source for button (OUTPUT HIGH)
-int activeSDA            = 32; // I2C Data line for LCD display (auto-detected)
-int activeSCL            = 33; // I2C Clock line for LCD display (auto-detected)
+int activeSDA            = 21; // Primary I2C Data line (Hardware default SDA: GPIO 21)
+int activeSCL            = 22; // Primary I2C Clock line (Hardware default SCL: GPIO 22)
 
 // =======================================================
 // WiFi & Web Server Configuration
@@ -315,10 +315,10 @@ bool initHD44780Direct(uint8_t addr, int sda, int scl) {
 
 bool detectAndInitLCD() {
   const int pairs[][2] = {
-    {32, 33}, // Primary wiring: SDA=32, SCL=33
-    {21, 22}, // Standard ESP32 pins: SDA=21, SCL=22
-    {33, 32}, // In case SDA/SCL were reversed
-    {22, 21}
+    {21, 22}, // Primary standard ESP32 I2C pins: SDA=21, SCL=22
+    {32, 33}, // Secondary / alternate pins: SDA=32, SCL=33
+    {22, 21}, // In case SDA/SCL were reversed
+    {33, 32}
   };
 
   uint8_t foundAddr = 0;
