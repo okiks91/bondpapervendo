@@ -13,8 +13,8 @@ const int LPWM_PIN       = 26; // Reverse speed (PWM) on D26
 const int REN_PIN        = -1; // Unused (R_EN and L_EN jumpered to VCC on BTS7960)
 const int BUTTON_PIN     = 23; // Physical Push Button (Active-HIGH with INPUT_PULLDOWN)
 const int BUTTON_PWR_PIN = 19; // Provides 3.3V source for button (OUTPUT HIGH)
-const int I2C_SDA_PIN    = 32; // I2C Data line for LCD display
-const int I2C_SCL_PIN    = 33; // I2C Clock line for LCD display
+int activeSDA            = 32; // I2C Data line for LCD display (auto-detected)
+int activeSCL            = 33; // I2C Clock line for LCD display (auto-detected)
 
 // =======================================================
 // WiFi & Web Server Configuration
@@ -32,6 +32,7 @@ String localIPStr = "";
 // LCD Display Manager (Address 0x27, 16x2)
 // =======================================================
 LiquidCrystal_I2C lcd(0x27, 16, 2);
+uint8_t activeLcdAddr = 0x27;
 bool lcdReady = false;
 String currentL1 = "";
 String currentL2 = "";
@@ -132,10 +133,64 @@ void motorReverse(int speed) {
 }
 
 // =======================================================
-// I2C Bus Hardware Health Guard
+// I2C Bus Hardware Health Guard & Multi-Pin Auto-Detection
 // =======================================================
 bool isI2CBusHealthy() {
-  return (digitalRead(I2C_SDA_PIN) == HIGH && digitalRead(I2C_SCL_PIN) == HIGH);
+  if (!lcdReady || activeLcdAddr == 0) return false;
+  Wire.beginTransmission(activeLcdAddr);
+  return (Wire.endTransmission() == 0);
+}
+
+bool probeI2CPair(int sda, int scl, uint8_t &outAddr) {
+  Wire.end();
+  pinMode(sda, INPUT_PULLUP);
+  pinMode(scl, INPUT_PULLUP);
+  delay(5);
+  Wire.begin(sda, scl);
+  Wire.setClock(100000);
+  Wire.setTimeOut(30);
+
+  const uint8_t candidates[] = {0x27, 0x3F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E};
+  for (uint8_t a : candidates) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      outAddr = a;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool detectAndInitLCD() {
+  const int pairs[][2] = {
+    {32, 33},
+    {33, 32},
+    {21, 22},
+    {22, 21}
+  };
+
+  uint8_t foundAddr = 0;
+  for (auto &pair : pairs) {
+    int s = pair[0];
+    int c = pair[1];
+    if (probeI2CPair(s, c, foundAddr)) {
+      activeSDA = s;
+      activeSCL = c;
+      activeLcdAddr = foundAddr;
+      Serial.printf("[LCD] SUCCESS! LCD found at 0x%02X on SDA=%d, SCL=%d!\n", activeLcdAddr, activeSDA, activeSCL);
+
+      lcd = LiquidCrystal_I2C(activeLcdAddr, 16, 2);
+      lcd.init();
+      Wire.begin(activeSDA, activeSCL);
+      Wire.setClock(100000);
+      Wire.setTimeOut(50);
+      lcd.backlight();
+      lcd.clear();
+      lcdReady = true;
+      return true;
+    }
+  }
+  return false;
 }
 
 // =======================================================
@@ -143,10 +198,6 @@ bool isI2CBusHealthy() {
 // =======================================================
 void updateLCD(String l1, String l2, bool force = false) {
   if (!lcdReady) return;
-  if (!isI2CBusHealthy()) {
-    lcdReady = false;
-    return;
-  }
   if (!force && l1 == currentL1 && l2 == currentL2) return;
 
   currentL1 = l1;
@@ -216,16 +267,17 @@ void printPinStatus() {
   int btnPwrVal = digitalRead(BUTTON_PWR_PIN);
   int rpwmVal   = digitalRead(RPWM_PIN);
   int lpwmVal   = digitalRead(LPWM_PIN);
-  int sdaVal    = digitalRead(I2C_SDA_PIN);
-  int sclVal    = digitalRead(I2C_SCL_PIN);
+  int sdaVal    = digitalRead(activeSDA);
+  int sclVal    = digitalRead(activeSCL);
 
   Serial.printf("  COIN_PIN       (GPIO %2d): %s (%s)\n", COIN_PIN, coinVal ? "HIGH" : "LOW ", coinVal ? "Idle, 3.3V via 1N4007 OK" : "LOW (Pulled down / Active Pulse)");
   Serial.printf("  BUTTON_PIN     (GPIO %2d): %s (%s)\n", BUTTON_PIN, btnVal ? "HIGH" : "LOW ", btnVal ? "PRESSED / Active-HIGH" : "Released (Pulled Down OK)");
   Serial.printf("  BUTTON_PWR_PIN (GPIO %2d): %s (%s)\n", BUTTON_PWR_PIN, btnPwrVal ? "HIGH" : "LOW ", btnPwrVal ? "3.3V Power Source Active" : "LOW (Warning: Off!)");
   Serial.printf("  RPWM_PIN       (GPIO %2d): %s (Motor Forward PWM - D27)\n", RPWM_PIN, rpwmVal ? "HIGH" : "LOW ");
   Serial.printf("  LPWM_PIN       (GPIO %2d): %s (Motor Reverse PWM - D26)\n", LPWM_PIN, lpwmVal ? "HIGH" : "LOW ");
-  Serial.printf("  I2C_SDA_PIN    (GPIO %2d): %s (%s)\n", I2C_SDA_PIN, sdaVal ? "HIGH" : "LOW ", sdaVal ? "3.3V Pullup OK" : "LOW (Grounded / Shorted)");
-  Serial.printf("  I2C_SCL_PIN    (GPIO %2d): %s (%s)\n", I2C_SCL_PIN, sclVal ? "HIGH" : "LOW ", sclVal ? "3.3V Pullup OK" : "LOW (Grounded / Shorted)");
+  Serial.printf("  I2C_SDA_PIN    (GPIO %2d): %s (%s)\n", activeSDA, sdaVal ? "HIGH" : "LOW ", sdaVal ? "3.3V Pullup OK" : "LOW (Grounded / Shorted)");
+  Serial.printf("  I2C_SCL_PIN    (GPIO %2d): %s (%s)\n", activeSCL, sclVal ? "HIGH" : "LOW ", sclVal ? "3.3V Pullup OK" : "LOW (Grounded / Shorted)");
+  Serial.printf("  LCD Display                 : %s (Addr: 0x%02X, SDA=%d, SCL=%d)\n", lcdReady ? "ACTIVE / DISPLAYING" : "NOT DETECTED", activeLcdAddr, activeSDA, activeSCL);
   Serial.printf("  WiFi Status                 : %s (IP: %s)\n", wifiConnected ? "CONNECTED" : "AP HOTSPOT", localIPStr.c_str());
   Serial.println("===========================================\n");
 }
@@ -552,42 +604,19 @@ void setup() {
   pinMode(COIN_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(COIN_PIN), coinPinChangeISR, CHANGE);
 
+  // Initialize I2C with internal pullups
+  pinMode(activeSDA, INPUT_PULLUP);
+  pinMode(activeSCL, INPUT_PULLUP);
+  delay(10);
+
   // Print all live pin statuses
   printPinStatus();
   testBtsPins();
 
-  // Initialize I2C with internal pullups on GPIO 32 and GPIO 33
-  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
-  pinMode(I2C_SCL_PIN, INPUT_PULLUP);
-  delay(10);
-
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(100000);
-  Wire.setTimeOut(50);
-  delay(50);
-
-  uint8_t foundAddr = 0;
-  if (isI2CBusHealthy()) {
-    for (uint8_t a : { (uint8_t)0x27, (uint8_t)0x3F }) {
-      Wire.beginTransmission(a);
-      if (Wire.endTransmission() == 0) {
-        foundAddr = a;
-        break;
-      }
-    }
-  } else {
-    Serial.println("[LCD WARNING] SDA (32) or SCL (33) is currently grounded! Skipping I2C write to prevent hang.");
-  }
-
-  if (foundAddr != 0) {
-    Serial.printf("[LCD] SUCCESS! LCD found at 0x%02X on SDA=32, SCL=33!\n", foundAddr);
-    lcd = LiquidCrystal_I2C(foundAddr, 16, 2);
-    lcd.begin(16, 2);
-    lcd.backlight();
-    lcdReady = true;
+  if (detectAndInitLCD()) {
     updateLCD("STARTING VENDO..", "CONNECTING WIFI ", true);
   } else {
-    Serial.println("[LCD] Not detected at boot. Background auto-reconnect is active.");
+    Serial.println("[LCD] Not detected on standard pin pairs. Background auto-scan active.");
   }
 
   // =======================================================
@@ -785,26 +814,18 @@ void loop() {
   // 4. Periodic LCD synchronization or background auto-reconnect
   static unsigned long lastLcdSyncMs = 0;
   if (!lcdReady) {
-    if (isI2CBusHealthy() && millis() - lastLcdSyncMs >= 2000) {
+    if (millis() - lastLcdSyncMs >= 2000) {
       lastLcdSyncMs = millis();
-      for (uint8_t a : { (uint8_t)0x27, (uint8_t)0x3F }) {
-        Wire.beginTransmission(a);
-        if (Wire.endTransmission() == 0) {
-          lcd = LiquidCrystal_I2C(a, 16, 2);
-          lcd.begin(16, 2);
-          lcd.backlight();
-          lcdReady = true;
-          Serial.printf("[LCD] Background connected at 0x%02X!\n", a);
-          refreshLCDScreen();
-          break;
-        }
+      if (detectAndInitLCD()) {
+        refreshLCDScreen();
       }
     }
-  } else if (currentState == STATE_IDLE && !manualMotorActive && millis() - lastLcdSyncMs >= 1000) {
+  } else if (currentState == STATE_IDLE && !manualMotorActive && millis() - lastLcdSyncMs >= 2000) {
     lastLcdSyncMs = millis();
     if (isI2CBusHealthy()) {
       refreshLCDScreen();
     } else {
+      Serial.println("[LCD] Bus lost connection. Will auto-reconnect.");
       lcdReady = false;
     }
   }
